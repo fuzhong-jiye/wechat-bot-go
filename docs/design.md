@@ -19,149 +19,106 @@
 - 底层通过 iLink Bot API（`ilinkai.weixin.qq.com`）与微信交互
 - 所有 API 请求体必须包含 `base_info: { channel_version: "1.0.2" }`
 
-## 2. 核心设计决策
+## 2. Bot 生命周期
 
-| 决策 | 结论 |
-|------|------|
-| 定位 | 高层 Bot 框架，自动管理登录/轮询/状态 |
-| Handler 模型 | 精确类型优先（OnText/OnImage/...）+ OnMessage 兜底 |
-| 场景 | 仅私聊 |
-| 登录 | 回调暴露 QR 数据，用户自行决定展示方式 |
-| 持久化 | Storage 接口 + SQLite/Memory 内置实现，支持多 session |
-| 媒体发送 | 完全封装（传 `io.Reader`） |
-| 媒体接收 | 按需下载（手动调用 `Download()`） |
-| 错误处理 | Error channel，用户控制重连 |
-| 对话模型 | 一个 Bot 实例 = 一个用户对话，多用户用多 Bot |
-| Context | 回复当前会话 + 通过 Bot 实例主动发送 |
-
-## 3. Bot 生命周期
-
-### 3.1 Bot 结构
+### 2.1 公开 API
 
 ```go
-type Bot struct {
-    opts         options
-    handlers     handlerRegistry
-    client       *ilinkClient
-    session      *Session
-    contextToken *TokenEntry      // 单个 token，对应唯一对话用户
-    errors       chan *BotError
-    stopCh       chan struct{}
-}
-
 func NewBot(opts ...Option) *Bot
-```
 
-### 3.2 Option 模式
-
-```go
 type Option func(*options)
 
 func WithStorage(s Storage) Option
 func WithSessionID(id string) Option        // 默认 "default"
 func WithQRHandler(fn QRHandler) Option     // 必须提供
-func WithPollTimeout(d time.Duration) Option // 默认 40s
-func WithHTTPClient(c *http.Client) Option
-```
 
-### 3.3 生命周期方法
-
-```go
 // Start 启动 bot：加载 session → 登录（如需）→ 开始轮询
 // 阻塞直到 ctx 取消或调用 Stop
+// 可重试错误（网络抖动）内部自动重试，致命错误返回 error
 func (b *Bot) Start(ctx context.Context) error
 
-// Stop 优雅停止：停止轮询 → SaveSession → 关闭 errors channel
-// 返回 error 以暴露 SaveSession 的潜在失败
-func (b *Bot) Stop() error
+// Stop 优雅停止，触发 Start 返回
+func (b *Bot) Stop()
 
-// Errors 返回带缓冲（cap=32）的错误 channel
-// 缓冲满时新错误会被丢弃（不阻塞轮询循环）
-func (b *Bot) Errors() <-chan *BotError
+// 发送消息（handler 内外均可调用）
+func (b *Bot) Send(text string) error
+func (b *Bot) SendImage(r io.Reader, filename string) error
+func (b *Bot) SendVoice(r io.Reader, filename string) error
+func (b *Bot) SendFile(r io.Reader, filename string) error
+func (b *Bot) SendVideo(r io.Reader, filename string) error
 
-// Reconnect 停止当前轮询循环，验证现有凭证，重新启动轮询
-// 如果 session 过期（API 返回 -14），触发重新 QR 登录流程
-func (b *Bot) Reconnect() error
+// 注册消息回调
+func (b *Bot) OnMessage(h func(msg Message))
 ```
 
-### 3.4 启动流程
+### 2.2 启动流程
 
 ```
 Start(ctx)
-  ├─ storage.LoadSession(sessionID)
-  │   ├─ 有有效 token → 直接进入轮询
+  ├─ storage.Load(sessionID)
+  │   ├─ 有有效 botToken → 直接进入轮询
   │   └─ 无 token → 触发登录流程
   │       ├─ 请求 QR 码
   │       ├─ 调用 QRHandler 回调
   │       ├─ 轮询扫码状态
-  │       └─ 获取 credentials → storage.SaveSession()
-  ├─ storage.LoadToken(sessionID) → 恢复 contextToken 到内存
+  │       └─ 获取 credentials → storage.Save()
   ├─ 进入消息轮询循环
   │   ├─ pollMessages(cursor)
-  │   ├─ 更新 cursor + contextToken
-  │   ├─ storage.SaveSession() + storage.SaveToken()
-  │   ├─ 分发消息到 handler
-  │   └─ 出错 → 写入 errors channel
-  └─ ctx.Done() 或 Stop() → SaveSession() → 退出
+  │   ├─ 更新 cursor + contextToken → storage.Save()
+  │   ├─ 分发消息到 OnMessage handler
+  │   └─ 出错 → 内部重试（见 2.3）
+  └─ ctx.Done() 或 Stop() → storage.Save() → return nil
 ```
 
-### 3.5 轮询错误恢复策略
+用户侧重连模式：
+
+```go
+for {
+    if err := bot.Start(ctx); err != nil {
+        log.Println("bot 退出:", err)
+        time.Sleep(5 * time.Second)
+        continue
+    }
+    break // ctx 取消，正常退出
+}
+```
+
+### 2.3 轮询错误恢复策略
 
 ```
 轮询出错
   ├─ API 返回 errcode=-14（session 过期）
-  │   → 写入 errors channel（ErrPoll）
-  │   → 停止轮询，等待用户调用 Reconnect()
+  │   → return ErrSessionExpired（致命，需重新登录）
   ├─ 其他错误
   │   → consecutiveErrors++
   │   → 等待 5 秒后重试
-  │   → 连续 5 次失败 → 写入 errors channel → 停止轮询
+  │   → 连续 5 次失败 → return error（致命）
   └─ 成功 → consecutiveErrors = 0
 ```
 
-### 3.6 BotError
-
 ```go
-type BotError struct {
-    Type    ErrorType
-    Err     error
-    Context string
-}
-
-type ErrorType int
-
-const (
-    ErrPoll ErrorType = iota
-    ErrSend
-    ErrLogin
-    ErrStorage
-)
-
-func (t ErrorType) String() string  // "poll", "send", "login", "storage"
+var ErrSessionExpired = errors.New("wechat: session expired, re-login required")
 ```
 
-## 4. 消息类型与 Handler
+## 3. 消息类型与 Handler
 
-### 4.1 Message
+### 3.1 Message
 
 一条微信消息可能包含多个 item（如文本 + 图片），因此 `Message` 包含 `[]Item` 而不是拆分成独立的类型消息。
 
 ```go
 type Message struct {
-    ID           string
-    FromUserID   string
-    ToUserID     string
-    ContextToken string
-    Timestamp    time.Time
-    Items        []Item
+    ID         string
+    FromUserID string
+    Timestamp  time.Time
+    Items      []Item
 }
 
-// 便捷方法
-func (m Message) Text() string          // 拼接所有 TextItem 的文本，无文本返回 ""
-func (m Message) HasType(t ItemType) bool
+// 便捷方法：拼接所有 TextItem 的文本，无文本返回 ""
+func (m Message) Text() string
 ```
 
-### 4.2 Item 与具体类型
+### 3.2 Item 与具体类型
 
 ```go
 type ItemType int
@@ -216,18 +173,7 @@ func (i *VideoItem) Download() (io.ReadCloser, error)
 
 `Download()` 内部通过闭包实现（构造 Item 时注入 `ilinkClient` 引用）：CDN 下载 → AES-128-ECB 解密 → 返回 `io.ReadCloser`。
 
-### 4.3 Handler 注册
-
-```go
-type MessageHandler func(ctx Context, msg Message)
-type QRHandler      func(qr QRCode)
-
-func (b *Bot) OnMessage(h MessageHandler)
-```
-
-只有一个 `OnMessage`。用户在 handler 内遍历 `msg.Items` 自行处理不同类型。
-
-### 4.4 分发逻辑
+### 3.3 分发逻辑
 
 Handler 在轮询 goroutine 中**同步调用**。如需长时间处理（如下载大文件），handler 应自行启动 goroutine。
 
@@ -237,64 +183,29 @@ Handler 在轮询 goroutine 中**同步调用**。如需长时间处理（如下
   → 调用 OnMessage handler（整条消息一次回调）
 ```
 
-## 5. Context 与发送
+## 4. 发送与 contextToken
 
-### 5.1 Context
-
-```go
-type Context struct {
-    bot          *Bot
-    fromUserID   string
-    contextToken string
-}
-
-func (c Context) Reply(text string) error
-func (c Context) ReplyImage(r io.Reader, filename string) error
-func (c Context) ReplyVoice(r io.Reader, filename string) error
-func (c Context) ReplyFile(r io.Reader, filename string) error
-func (c Context) ReplyVideo(r io.Reader, filename string) error
-
-func (c Context) Sender() string
-func (c Context) Bot() *Bot
-```
-
-### 5.2 主动发送
-
-通过 Bot 实例主动向对话用户发消息（不需要在 handler 中），前提是用户曾给 bot 发过消息（即存在有效 contextToken）：
-
-```go
-func (b *Bot) Send(text string) error
-func (b *Bot) SendImage(r io.Reader, filename string) error
-func (b *Bot) SendVoice(r io.Reader, filename string) error
-func (b *Bot) SendFile(r io.Reader, filename string) error
-func (b *Bot) SendVideo(r io.Reader, filename string) error
-```
-
-不需要传 `userID` — 一个 Bot 实例只对应一个用户。
-
-### 5.3 contextToken 管理
+### 4.1 contextToken 管理
 
 SDK 自动管理，用户不需要感知。一个 Bot 实例只维护一个 contextToken。
 
-- 轮询收到消息 → `bot.contextToken = TokenEntry{token, time.Now()}` → 持久化
+- 轮询收到消息 → 更新 `session.ContextToken` + `session.TokenUpdatedAt` → 持久化
 - 发送时检查 → 不存在返回 `ErrNoContextToken`，超过 24h 返回 `ErrContextTokenExpired`
 - 过期 token 保留，用户重新发消息自然刷新
 
 ```go
 var ErrNoContextToken = errors.New(
-    "wechat: no context token, " +
-    "the user must message the bot first",
+    "wechat: no context token, the user must message the bot first",
 )
 
 var ErrContextTokenExpired = errors.New(
-    "wechat: context token expired, " +
-    "the user has not messaged the bot in the last 24 hours",
+    "wechat: context token expired, the user has not messaged the bot in the last 24 hours",
 )
 ```
 
-### 5.4 媒体发送内部流程（用户不感知）
+### 4.2 媒体发送内部流程
 
-`ReplyImage(r, "photo.jpg")` 内部：
+`SendImage(r, "photo.jpg")` 内部：
 
 ```
 1. io.ReadAll(r) → []byte
@@ -307,7 +218,7 @@ var ErrContextTokenExpired = errors.New(
 8. sendMessage API，附带 CDN 下载参数
 ```
 
-### 5.5 发送消息内部协议细节
+### 4.3 发送消息内部协议细节
 
 每条发送请求必须包含：
 
@@ -327,85 +238,65 @@ type sendRequest struct {
 // 相同 client_id 的消息只会被投递一次
 ```
 
-## 6. Storage
+## 5. Storage
 
-### 6.1 接口
+### 5.1 接口
 
 ```go
 type Storage interface {
-    SaveSession(session Session) error
-    LoadSession(sessionID string) (Session, bool, error)
-    DeleteSession(sessionID string) error
-    ListSessions() ([]Session, error)
-
-    SaveToken(sessionID string, entry TokenEntry) error
-    LoadToken(sessionID string) (TokenEntry, bool, error)  // bool=是否存在
+    Save(session Session) error
+    Load(sessionID string) (Session, bool, error)
 }
 
 type Session struct {
-    ID       string
-    BotID    string  // ilink_bot_id，登录时获取
-    UserID   string  // ilink_user_id，登录时获取
-    BotToken string
-    BaseURL  string
-    Cursor   string
-}
-
-type TokenEntry struct {
-    Token     string
-    UpdatedAt time.Time
+    ID             string
+    BotToken       string
+    BaseURL        string
+    Cursor         string
+    ContextToken   string
+    TokenUpdatedAt time.Time
+    PeerUserID     string  // 对话用户 ID，从首条入站消息获取
 }
 ```
 
-### 6.2 MemoryStorage
+### 5.2 内置实现
+
+**MemoryStorage** — `sync.RWMutex` + `map`，适合测试。
 
 ```go
 func NewMemoryStorage() Storage
 ```
 
-- `sync.RWMutex` + `map`
-- 进程退出数据丢失
-- 适合测试和一次性使用
-
-### 6.3 SQLiteStorage
+**SQLiteStorage** — 依赖 `modernc.org/sqlite`（纯 Go，无 CGO）。
 
 ```go
 func NewSQLiteStorage(dsn string) (Storage, error)
 ```
 
-- 依赖 `modernc.org/sqlite`（纯 Go，无 CGO）
-- 表结构：
-
 ```sql
 CREATE TABLE sessions (
-    id        TEXT PRIMARY KEY,
-    bot_id    TEXT NOT NULL DEFAULT '',
-    user_id   TEXT NOT NULL DEFAULT '',
-    bot_token TEXT NOT NULL,
-    base_url  TEXT NOT NULL,
-    cursor    TEXT NOT NULL DEFAULT ''
-);
-
-CREATE TABLE context_tokens (
-    session_id TEXT PRIMARY KEY,
-    token      TEXT NOT NULL,
-    updated_at DATETIME NOT NULL,
-    FOREIGN KEY (session_id) REFERENCES sessions(id) ON DELETE CASCADE
+    id               TEXT PRIMARY KEY,
+    bot_token        TEXT NOT NULL,
+    base_url         TEXT NOT NULL,
+    cursor           TEXT NOT NULL DEFAULT '',
+    context_token    TEXT NOT NULL DEFAULT '',
+    token_updated_at DATETIME,
+    peer_user_id     TEXT NOT NULL DEFAULT ''
 );
 ```
 
-### 6.4 Storage 调用时机
+### 5.3 调用时机
 
 ```
-Start()        → LoadSession + LoadToken
-登录成功        → SaveSession
-每次轮询新消息  → SaveSession (cursor) + SaveToken (contextToken)
-Stop()         → SaveSession (最后保存 cursor)
+Start()        → Load(sessionID)
+登录成功        → Save(session)
+每次轮询新消息  → Save(session)  // cursor + contextToken + peerUserID
+Stop()         → Save(session)
 ```
 
-## 7. HTTP 客户端与认证
+## 6. HTTP 客户端与认证
 
-### 7.1 ilinkClient（不导出）
+### 6.1 ilinkClient（不导出）
 
 ```go
 type ilinkClient struct {
@@ -415,7 +306,7 @@ type ilinkClient struct {
 }
 ```
 
-### 7.2 认证头
+### 6.2 认证头
 
 每个请求：
 
@@ -438,7 +329,7 @@ type baseInfo struct {
 }
 ```
 
-### 7.3 API 方法
+### 6.3 API 方法
 
 ```go
 func (c *ilinkClient) getBotQRCode() (*QRCode, error)
@@ -447,13 +338,9 @@ func (c *ilinkClient) getUpdates(ctx context.Context, cursor string) (*UpdatesRe
 func (c *ilinkClient) sendMessage(msg sendRequest) error
 func (c *ilinkClient) getUploadURL(req uploadURLRequest) (*UploadURLResult, error)
 func (c *ilinkClient) uploadToCDN(url string, data []byte) (downloadParam string, err error) // 重试 3 次，返回 x-encrypted-param
-
-// 可选能力（v1 包含）
-func (c *ilinkClient) getConfig(userID string) (*ConfigResult, error)   // 获取 typing_ticket
-func (c *ilinkClient) sendTyping(userID string, ticket string) error    // 发送"正在输入"状态
 ```
 
-### 7.4 统一响应处理
+### 6.4 统一响应处理
 
 ```go
 func (c *ilinkClient) do(ctx context.Context, method, path string, body, result any) error
@@ -461,17 +348,16 @@ func (c *ilinkClient) do(ctx context.Context, method, path string, body, result 
 
 内部：序列化 → 构建请求 + 认证头 → 发送 → 检查 HTTP status → 解析 JSON → 检查 `ret/errcode` → 返回 `*APIError` 或 nil。
 
-### 7.5 QRCode
+### 6.5 QRCode
 
 ```go
 type QRCode struct {
-    ID   string
-    URL  string
-    Data []byte
+    ID  string
+    URL string
 }
 ```
 
-### 7.6 APIError
+### 6.6 APIError
 
 ```go
 type APIError struct {
@@ -484,7 +370,7 @@ type APIError struct {
 func (e *APIError) Error() string
 ```
 
-## 8. 加解密
+## 7. 加解密
 
 ### AES-128-ECB（不导出）
 
@@ -507,35 +393,7 @@ func aesECBDecrypt(data []byte, key []byte) ([]byte, error)
   - 32 字节 hex 字符串 → hex 解码为 16 字节后使用
 - 判断逻辑：`len(decoded) == 16 ? 直接用 : hexDecode(decoded)`
 
-## 9. 错误类型汇总
-
-| 错误 | 说明 |
-|------|------|
-| `*APIError` | iLink API 返回的业务错误 |
-| `*BotError` | 带分类的运行时错误（通过 error channel） |
-| `ErrNoContextToken` | 用户尚未给 bot 发过消息 |
-| `ErrContextTokenExpired` | contextToken 超过 24 小时过期 |
-
-## 10. 文件结构
-
-```
-github.com/fuzhong-jiye/wechat-bot-go/
-├── bot.go              // Bot, NewBot, Start, Stop, Reconnect, Errors, OnMessage
-├── option.go           // Option, With* 函数
-├── context.go          // Context, Reply*, Sender, Bot
-├── message.go          // Message, Item, TextItem, ImageItem, etc.
-├── client.go           // ilinkClient, do(), 认证头, API 方法
-├── crypto.go           // AES-128-ECB 加解密
-├── storage.go          // Storage 接口, Session, TokenEntry
-├── storage_memory.go   // MemoryStorage 实现
-├── storage_sqlite.go   // SQLiteStorage 实现
-├── errors.go           // BotError, APIError, sentinel errors
-└── example_test.go     // 可运行的 Example 函数
-```
-
-## 11. 完整用户示例
-
-### 11.1 基础用法 — 一个 Bot 对应一个用户
+## 8. 完整用户示例
 
 ```go
 package main
@@ -565,12 +423,11 @@ func main() {
         }),
     )
 
-    bot.OnMessage(func(ctx wechat.Context, msg wechat.Message) {
+    bot.OnMessage(func(msg wechat.Message) {
         for _, item := range msg.Items {
             switch item.Type {
             case wechat.ItemText:
-                log.Printf("收到文本: %s", item.Text.Content)
-                ctx.Reply("你说了: " + item.Text.Content)
+                bot.Send("你说了: " + item.Text.Content)
             case wechat.ItemImage:
                 reader, err := item.Image.Download()
                 if err != nil {
@@ -578,9 +435,7 @@ func main() {
                     continue
                 }
                 reader.Close()
-                ctx.Reply("图片已收到")
-            default:
-                log.Printf("未处理类型: %d", item.Type)
+                bot.Send("图片已收到")
             }
         }
     })
@@ -588,64 +443,28 @@ func main() {
     ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt)
     defer cancel()
 
-    go func() {
-        if err := bot.Start(ctx); err != nil {
-            log.Fatal("启动失败:", err)
-        }
-    }()
-
-    // 主动发送 — 不需要指定 userID，Bot 只对应一个用户
+    // 主动发送
     go func() {
         ticker := time.NewTicker(60 * time.Second)
         defer ticker.Stop()
         for {
             select {
             case <-ticker.C:
-                if err := bot.Send("这是一条定时主动消息"); err != nil {
-                    log.Println("主动发送失败:", err)
-                }
+                bot.Send("定时消息")
             case <-ctx.Done():
                 return
             }
         }
     }()
 
-    // 错误处理
+    // Start 阻塞，致命错误返回，可重试
     for {
-        select {
-        case err := <-bot.Errors():
-            log.Printf("错误 [%s]: %v", err.Type, err.Err)
-            if err.Type == wechat.ErrPoll {
-                bot.Reconnect()
-            }
-        case <-ctx.Done():
-            bot.Stop()
-            return
+        err := bot.Start(ctx)
+        if ctx.Err() != nil {
+            break // 正常退出
         }
+        log.Println("bot 退出:", err)
+        time.Sleep(5 * time.Second)
     }
-}
-```
-
-### 11.2 多用户场景 — 多个 Bot 共享 Storage
-
-```go
-store, _ := wechat.NewSQLiteStorage("bots.db")
-
-// 每个 Bot 实例对应一个用户对话
-userIDs := []string{"user-alice", "user-bob"}
-for _, id := range userIDs {
-    bot := wechat.NewBot(
-        wechat.WithStorage(store),
-        wechat.WithSessionID(id),
-        wechat.WithQRHandler(func(qr wechat.QRCode) {
-            fmt.Printf("[%s] 请扫码: %s\n", id, qr.URL)
-        }),
-    )
-    bot.OnMessage(func(ctx wechat.Context, msg wechat.Message) {
-        if text := msg.Text(); text != "" {
-            ctx.Reply("收到: " + text)
-        }
-    })
-    go bot.Start(ctx)
 }
 ```
