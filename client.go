@@ -197,6 +197,10 @@ type ilinkClient struct {
 	baseURL    string
 	botToken   string
 	httpClient *http.Client
+	logger     Logger
+	logLevel   LogLevel
+	sessionID  string
+	peerUserID func() string
 }
 
 func newIlinkClient(baseURL, botToken string) *ilinkClient {
@@ -204,7 +208,25 @@ func newIlinkClient(baseURL, botToken string) *ilinkClient {
 		baseURL:    baseURL,
 		botToken:   botToken,
 		httpClient: &http.Client{},
+		logger:     NopLogger{},
+		logLevel:   LogInfo,
 	}
+}
+
+func (c *ilinkClient) log(ctx context.Context, level LogLevel, msg string, fields ...Field) {
+	if c.logger == nil || !shouldLog(c.logLevel, level) {
+		return
+	}
+	fields = appendFields(fields,
+		Field{Key: "base_url", Value: c.baseURL},
+		Field{Key: "session_id", Value: c.sessionID},
+	)
+	if c.peerUserID != nil {
+		if peer := c.peerUserID(); peer != "" {
+			fields = append(fields, Field{Key: "peer_user_id", Value: maskID(peer)})
+		}
+	}
+	c.logger.Log(ctx, level, msg, fields...)
 }
 
 func (c *ilinkClient) setAuth(req *http.Request) {
@@ -224,10 +246,16 @@ func (c *ilinkClient) setAuth(req *http.Request) {
 }
 
 func (c *ilinkClient) do(ctx context.Context, method, path string, body, result any) error {
+	start := time.Now()
 	var bodyReader io.Reader
 	if body != nil {
 		data, err := json.Marshal(body)
 		if err != nil {
+			c.log(ctx, LogError, "request.failed",
+				Field{Key: "op", Value: path},
+				Field{Key: "http_method", Value: method},
+				Field{Key: "error", Value: sanitizeError(err)},
+			)
 			return fmt.Errorf("marshal request: %w", err)
 		}
 		bodyReader = bytes.NewReader(data)
@@ -236,22 +264,51 @@ func (c *ilinkClient) do(ctx context.Context, method, path string, body, result 
 	reqURL := c.baseURL + path
 	req, err := http.NewRequestWithContext(ctx, method, reqURL, bodyReader)
 	if err != nil {
+		c.log(ctx, LogError, "request.failed",
+			Field{Key: "op", Value: path},
+			Field{Key: "http_method", Value: method},
+			Field{Key: "error", Value: sanitizeError(err)},
+		)
 		return fmt.Errorf("create request: %w", err)
 	}
 	c.setAuth(req)
 
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
+		c.log(ctx, LogError, "request.failed",
+			Field{Key: "op", Value: path},
+			Field{Key: "http_method", Value: method},
+			Field{Key: "duration_ms", Value: time.Since(start).Milliseconds()},
+			Field{Key: "error", Value: sanitizeError(err)},
+		)
 		return fmt.Errorf("http request: %w", err)
 	}
 	defer resp.Body.Close()
 
 	respBody, err := io.ReadAll(resp.Body)
 	if err != nil {
+		c.log(ctx, LogError, "request.failed",
+			Field{Key: "op", Value: path},
+			Field{Key: "http_method", Value: method},
+			Field{Key: "http_status", Value: resp.StatusCode},
+			Field{Key: "duration_ms", Value: time.Since(start).Milliseconds()},
+			Field{Key: "error", Value: sanitizeError(err)},
+		)
 		return fmt.Errorf("read response: %w", err)
 	}
 
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		apiErr := &APIError{
+			HTTPStatus: resp.StatusCode,
+			ErrMsg:     string(respBody),
+		}
+		c.log(ctx, LogError, "request.failed",
+			Field{Key: "op", Value: path},
+			Field{Key: "http_method", Value: method},
+			Field{Key: "http_status", Value: resp.StatusCode},
+			Field{Key: "duration_ms", Value: time.Since(start).Milliseconds()},
+			Field{Key: "error", Value: sanitizeError(apiErr)},
+		)
 		return &APIError{
 			HTTPStatus: resp.StatusCode,
 			ErrMsg:     string(respBody),
@@ -260,6 +317,13 @@ func (c *ilinkClient) do(ctx context.Context, method, path string, body, result 
 
 	if result != nil && len(respBody) > 0 {
 		if err := json.Unmarshal(respBody, result); err != nil {
+			c.log(ctx, LogError, "request.failed",
+				Field{Key: "op", Value: path},
+				Field{Key: "http_method", Value: method},
+				Field{Key: "http_status", Value: resp.StatusCode},
+				Field{Key: "duration_ms", Value: time.Since(start).Milliseconds()},
+				Field{Key: "error", Value: sanitizeError(err)},
+			)
 			return fmt.Errorf("unmarshal response: %w", err)
 		}
 	}
@@ -274,6 +338,21 @@ func (c *ilinkClient) do(ctx context.Context, method, path string, body, result 
 		json.Unmarshal(respBody, &envelope)
 	}
 	if envelope.Ret != 0 || envelope.ErrCode != 0 {
+		apiErr := &APIError{
+			HTTPStatus: resp.StatusCode,
+			Ret:        envelope.Ret,
+			ErrCode:    envelope.ErrCode,
+			ErrMsg:     envelope.ErrMsg,
+		}
+		c.log(ctx, LogError, "request.failed",
+			Field{Key: "op", Value: path},
+			Field{Key: "http_method", Value: method},
+			Field{Key: "http_status", Value: resp.StatusCode},
+			Field{Key: "ret", Value: envelope.Ret},
+			Field{Key: "errcode", Value: envelope.ErrCode},
+			Field{Key: "duration_ms", Value: time.Since(start).Milliseconds()},
+			Field{Key: "error", Value: sanitizeError(apiErr)},
+		)
 		return &APIError{
 			HTTPStatus: resp.StatusCode,
 			Ret:        envelope.Ret,
@@ -282,13 +361,26 @@ func (c *ilinkClient) do(ctx context.Context, method, path string, body, result 
 		}
 	}
 
+	c.log(ctx, LogDebug, "request.succeeded",
+		Field{Key: "op", Value: path},
+		Field{Key: "http_method", Value: method},
+		Field{Key: "http_status", Value: resp.StatusCode},
+		Field{Key: "duration_ms", Value: time.Since(start).Milliseconds()},
+	)
 	return nil
 }
 
 // --- API methods ---
 
 func (c *ilinkClient) getBotQRCode(ctx context.Context) (*wireQRCodeResponse, error) {
-	noAuth := &ilinkClient{baseURL: defaultBaseURL, httpClient: c.httpClient}
+	noAuth := &ilinkClient{
+		baseURL:    c.baseURL,
+		httpClient: c.httpClient,
+		logger:     c.logger,
+		logLevel:   c.logLevel,
+		sessionID:  c.sessionID,
+		peerUserID: c.peerUserID,
+	}
 	var resp wireQRCodeResponse
 	err := noAuth.do(ctx, http.MethodGet, "/ilink/bot/get_bot_qrcode?bot_type=3", nil, &resp)
 	return &resp, err
@@ -297,30 +389,52 @@ func (c *ilinkClient) getBotQRCode(ctx context.Context) (*wireQRCodeResponse, er
 func (c *ilinkClient) getQRCodeStatus(ctx context.Context, qrCode string) (*wireQRCodeStatusResponse, error) {
 	path := "/ilink/bot/get_qrcode_status?qrcode=" + url.QueryEscape(qrCode)
 
-	reqURL := defaultBaseURL + path
+	reqURL := c.baseURL + path
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, reqURL, nil)
 	if err != nil {
 		return nil, fmt.Errorf("create request: %w", err)
 	}
-	noAuth := &ilinkClient{baseURL: defaultBaseURL, httpClient: c.httpClient}
+	noAuth := &ilinkClient{baseURL: c.baseURL, httpClient: c.httpClient}
 	noAuth.setAuth(req)
 	req.Header.Set("iLink-App-ClientVersion", "1")
 
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
+		c.log(ctx, LogError, "request.failed",
+			Field{Key: "op", Value: path},
+			Field{Key: "http_method", Value: http.MethodGet},
+			Field{Key: "error", Value: sanitizeError(err)},
+		)
 		return nil, fmt.Errorf("http request: %w", err)
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		body, _ := io.ReadAll(resp.Body)
+		c.log(ctx, LogError, "request.failed",
+			Field{Key: "op", Value: path},
+			Field{Key: "http_method", Value: http.MethodGet},
+			Field{Key: "http_status", Value: resp.StatusCode},
+			Field{Key: "error", Value: sanitizeError(&APIError{HTTPStatus: resp.StatusCode, ErrMsg: string(body)})},
+		)
 		return nil, &APIError{HTTPStatus: resp.StatusCode, ErrMsg: string(body)}
 	}
 
 	var result wireQRCodeStatusResponse
 	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		c.log(ctx, LogError, "request.failed",
+			Field{Key: "op", Value: path},
+			Field{Key: "http_method", Value: http.MethodGet},
+			Field{Key: "http_status", Value: resp.StatusCode},
+			Field{Key: "error", Value: sanitizeError(err)},
+		)
 		return nil, fmt.Errorf("decode response: %w", err)
 	}
+	c.log(ctx, LogDebug, "request.succeeded",
+		Field{Key: "op", Value: path},
+		Field{Key: "http_method", Value: http.MethodGet},
+		Field{Key: "http_status", Value: resp.StatusCode},
+	)
 	return &result, nil
 }
 
@@ -363,25 +477,48 @@ func (c *ilinkClient) uploadToCDN(ctx context.Context, cdnURL string, data []byt
 		resp, err := c.httpClient.Do(req)
 		if err != nil {
 			lastErr = err
+			c.log(ctx, LogWarn, "cdn.upload.retry",
+				Field{Key: "attempt", Value: attempt},
+				Field{Key: "error", Value: sanitizeError(err)},
+			)
 			continue
 		}
 		resp.Body.Close()
 
 		if resp.StatusCode >= 400 && resp.StatusCode < 500 {
 			errMsg := resp.Header.Get("x-error-message")
+			c.log(ctx, LogError, "cdn.upload.failed",
+				Field{Key: "attempt", Value: attempt},
+				Field{Key: "http_status", Value: resp.StatusCode},
+				Field{Key: "error", Value: sanitizeString(errMsg)},
+			)
 			return "", fmt.Errorf("CDN upload client error %d: %s", resp.StatusCode, errMsg)
 		}
 		if resp.StatusCode != 200 {
 			lastErr = fmt.Errorf("CDN upload server error: status %d", resp.StatusCode)
+			c.log(ctx, LogWarn, "cdn.upload.retry",
+				Field{Key: "attempt", Value: attempt},
+				Field{Key: "http_status", Value: resp.StatusCode},
+				Field{Key: "error", Value: sanitizeError(lastErr)},
+			)
 			continue
 		}
 
 		downloadParam := resp.Header.Get("x-encrypted-param")
 		if downloadParam == "" {
+			c.log(ctx, LogError, "cdn.upload.failed",
+				Field{Key: "attempt", Value: attempt},
+				Field{Key: "error", Value: "missing download parameter"},
+			)
 			return "", fmt.Errorf("CDN upload response missing x-encrypted-param header")
 		}
+		c.log(ctx, LogInfo, "cdn.upload.succeeded",
+			Field{Key: "attempt", Value: attempt},
+			Field{Key: "size", Value: len(data)},
+		)
 		return downloadParam, nil
 	}
+	c.log(ctx, LogError, "cdn.upload.failed", Field{Key: "error", Value: sanitizeError(lastErr)})
 	return "", fmt.Errorf("CDN upload failed after 3 attempts: %w", lastErr)
 }
 
@@ -394,21 +531,25 @@ func (c *ilinkClient) downloadFromCDN(ctx context.Context, encryptQueryParam, ae
 
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
+		c.log(ctx, LogError, "cdn.download.failed", Field{Key: "error", Value: sanitizeError(err)})
 		return nil, fmt.Errorf("CDN download: %w", err)
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode != 200 {
+		c.log(ctx, LogError, "cdn.download.failed", Field{Key: "http_status", Value: resp.StatusCode})
 		return nil, fmt.Errorf("CDN download failed: status %d", resp.StatusCode)
 	}
 
 	encrypted, err := io.ReadAll(resp.Body)
 	if err != nil {
+		c.log(ctx, LogError, "cdn.download.failed", Field{Key: "error", Value: sanitizeError(err)})
 		return nil, fmt.Errorf("read CDN response: %w", err)
 	}
 
 	decoded, err := base64.StdEncoding.DecodeString(aesKeyBase64)
 	if err != nil {
+		c.log(ctx, LogError, "cdn.download.failed", Field{Key: "error", Value: sanitizeError(err)})
 		return nil, fmt.Errorf("decode aes_key: %w", err)
 	}
 
@@ -419,13 +560,21 @@ func (c *ilinkClient) downloadFromCDN(ctx context.Context, encryptQueryParam, ae
 	case 32:
 		aesKey, err = hexDecode(decoded)
 		if err != nil {
+			c.log(ctx, LogError, "cdn.download.failed", Field{Key: "error", Value: sanitizeError(err)})
 			return nil, fmt.Errorf("hex decode aes_key: %w", err)
 		}
 	default:
+		c.log(ctx, LogError, "cdn.download.failed", Field{Key: "error", Value: "unexpected aes key length"})
 		return nil, fmt.Errorf("unexpected aes_key length after base64: %d", len(decoded))
 	}
 
-	return aesECBDecrypt(encrypted, aesKey)
+	data, err := aesECBDecrypt(encrypted, aesKey)
+	if err != nil {
+		c.log(ctx, LogError, "cdn.download.failed", Field{Key: "error", Value: sanitizeError(err)})
+		return nil, err
+	}
+	c.log(ctx, LogDebug, "cdn.download.succeeded", Field{Key: "size", Value: len(data)})
+	return data, nil
 }
 
 func hexDecode(src []byte) ([]byte, error) {

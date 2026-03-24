@@ -14,6 +14,7 @@
 # Go workspace
 go.work
 go.work.sum
+.gocache/
 
 # IDE
 .idea/

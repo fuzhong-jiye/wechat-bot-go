@@ -20,6 +20,24 @@ const (
 	ItemVideo ItemType = 5
 )
 
+// String returns a stable log-friendly item type name.
+func (t ItemType) String() string {
+	switch t {
+	case ItemText:
+		return "text"
+	case ItemImage:
+		return "image"
+	case ItemVoice:
+		return "voice"
+	case ItemFile:
+		return "file"
+	case ItemVideo:
+		return "video"
+	default:
+		return "unknown"
+	}
+}
+
 // Message represents an inbound WeChat message with one or more items.
 type Message struct {
 	ID         string

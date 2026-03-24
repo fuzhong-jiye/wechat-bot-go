@@ -2,10 +2,29 @@ package wechat
 
 import (
 	"context"
+	"io"
 	"net/http"
-	"net/http/httptest"
+	"strings"
 	"testing"
 )
+
+type roundTripFunc func(*http.Request) (*http.Response, error)
+
+func (f roundTripFunc) RoundTrip(req *http.Request) (*http.Response, error) {
+	return f(req)
+}
+
+func newTestResponse(status int, body string) *http.Response {
+	return &http.Response{
+		StatusCode: status,
+		Header:     make(http.Header),
+		Body:       io.NopCloser(strings.NewReader(body)),
+	}
+}
+
+func newTestClient(rt roundTripFunc) *http.Client {
+	return &http.Client{Transport: rt}
+}
 
 func TestBuildCDNDownloadURL(t *testing.T) {
 	got := buildCDNDownloadURL("enc-param-123", "https://cdn.example.com/c2c")
@@ -33,13 +52,12 @@ func TestBuildCDNUploadURL(t *testing.T) {
 
 func TestClientDoAuthHeaders(t *testing.T) {
 	var gotHeaders http.Header
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		gotHeaders = r.Header
-		w.Write([]byte(`{"ret":0}`))
-	}))
-	defer srv.Close()
+	c := newIlinkClient("https://example.invalid", "test-token")
+	c.httpClient = newTestClient(func(r *http.Request) (*http.Response, error) {
+		gotHeaders = r.Header.Clone()
+		return newTestResponse(200, `{"ret":0}`), nil
+	})
 
-	c := newIlinkClient(srv.URL, "test-token")
 	err := c.do(context.Background(), http.MethodPost, "/test", map[string]string{"key": "val"}, nil)
 	if err != nil {
 		t.Fatal(err)
@@ -61,13 +79,12 @@ func TestClientDoAuthHeaders(t *testing.T) {
 
 func TestClientDoNoAuthWhenEmpty(t *testing.T) {
 	var gotHeaders http.Header
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		gotHeaders = r.Header
-		w.Write([]byte(`{"ret":0}`))
-	}))
-	defer srv.Close()
+	c := newIlinkClient("https://example.invalid", "")
+	c.httpClient = newTestClient(func(r *http.Request) (*http.Response, error) {
+		gotHeaders = r.Header.Clone()
+		return newTestResponse(200, `{"ret":0}`), nil
+	})
 
-	c := newIlinkClient(srv.URL, "")
 	err := c.do(context.Background(), http.MethodGet, "/test", nil, nil)
 	if err != nil {
 		t.Fatal(err)
@@ -79,12 +96,11 @@ func TestClientDoNoAuthWhenEmpty(t *testing.T) {
 }
 
 func TestClientDoAPIError(t *testing.T) {
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Write([]byte(`{"ret":-14,"errcode":-14,"errmsg":"session expired"}`))
-	}))
-	defer srv.Close()
+	c := newIlinkClient("https://example.invalid", "token")
+	c.httpClient = newTestClient(func(r *http.Request) (*http.Response, error) {
+		return newTestResponse(200, `{"ret":-14,"errcode":-14,"errmsg":"session expired"}`), nil
+	})
 
-	c := newIlinkClient(srv.URL, "token")
 	err := c.do(context.Background(), http.MethodPost, "/test", nil, nil)
 	if err == nil {
 		t.Fatal("expected error")
@@ -99,13 +115,11 @@ func TestClientDoAPIError(t *testing.T) {
 }
 
 func TestClientDoHTTPError(t *testing.T) {
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(500)
-		w.Write([]byte("internal error"))
-	}))
-	defer srv.Close()
+	c := newIlinkClient("https://example.invalid", "token")
+	c.httpClient = newTestClient(func(r *http.Request) (*http.Response, error) {
+		return newTestResponse(500, "internal error"), nil
+	})
 
-	c := newIlinkClient(srv.URL, "token")
 	err := c.do(context.Background(), http.MethodPost, "/test", nil, nil)
 	if err == nil {
 		t.Fatal("expected error")
@@ -120,12 +134,11 @@ func TestClientDoHTTPError(t *testing.T) {
 }
 
 func TestClientDoResultParsing(t *testing.T) {
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Write([]byte(`{"ret":0,"data":"hello"}`))
-	}))
-	defer srv.Close()
+	c := newIlinkClient("https://example.invalid", "token")
+	c.httpClient = newTestClient(func(r *http.Request) (*http.Response, error) {
+		return newTestResponse(200, `{"ret":0,"data":"hello"}`), nil
+	})
 
-	c := newIlinkClient(srv.URL, "token")
 	var result struct {
 		Data string `json:"data"`
 	}
@@ -135,5 +148,22 @@ func TestClientDoResultParsing(t *testing.T) {
 	}
 	if result.Data != "hello" {
 		t.Errorf("Data = %q, want %q", result.Data, "hello")
+	}
+}
+
+func TestGetQRCodeStatusSetsClientVersionHeader(t *testing.T) {
+	var gotHeaders http.Header
+	c := newIlinkClient("https://example.invalid", "")
+	c.httpClient = newTestClient(func(r *http.Request) (*http.Response, error) {
+		gotHeaders = r.Header.Clone()
+		return newTestResponse(200, `{"status":"wait"}`), nil
+	})
+
+	_, err := c.getQRCodeStatus(context.Background(), "qr-123")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := gotHeaders.Get("iLink-App-ClientVersion"); got != "1" {
+		t.Errorf("iLink-App-ClientVersion = %q, want 1", got)
 	}
 }
