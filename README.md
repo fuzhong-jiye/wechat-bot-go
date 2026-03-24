@@ -17,7 +17,7 @@
 安装依赖：
 
 ```bash
-go get github.com/fuzhong-jiye/wechat-bot-go
+go get github.com/fuzhong-jiye/wechat-bot-go@v1.0.0
 ```
 
 如果你想运行仓库内示例：
