@@ -31,18 +31,6 @@ const (
 	uploadMediaVoice = 4
 )
 
-// ItemType is defined here temporarily until message.go is created in Task 6.
-// TODO: Remove this when message.go is added.
-type ItemType int
-
-const (
-	ItemText  ItemType = 1
-	ItemImage ItemType = 2
-	ItemVoice ItemType = 3
-	ItemFile  ItemType = 4
-	ItemVideo ItemType = 5
-)
-
 func uploadMediaType(t ItemType) int {
 	switch t {
 	case ItemImage:
