@@ -142,7 +142,9 @@ func (t ErrorType) String() string  // "poll", "send", "login", "storage"
 
 ## 4. 消息类型与 Handler
 
-### 4.1 消息类型
+### 4.1 Message
+
+一条微信消息可能包含多个 item（如文本 + 图片），因此 `Message` 包含 `[]Item` 而不是拆分成独立的类型消息。
 
 ```go
 type Message struct {
@@ -151,92 +153,88 @@ type Message struct {
     ToUserID     string
     ContextToken string
     Timestamp    time.Time
-    RawItems     []MessageItem
+    Items        []Item
 }
 
-type TextMessage struct {
-    Message
-    Text string
+// 便捷方法
+func (m Message) Text() string          // 拼接所有 TextItem 的文本，无文本返回 ""
+func (m Message) HasType(t ItemType) bool
+```
+
+### 4.2 Item 与具体类型
+
+```go
+type ItemType int
+
+const (
+    ItemText  ItemType = 1
+    ItemImage ItemType = 2
+    ItemVoice ItemType = 3
+    ItemFile  ItemType = 4
+    ItemVideo ItemType = 5
+)
+
+type Item struct {
+    Type  ItemType
+    Text  *TextItem
+    Image *ImageItem
+    Voice *VoiceItem
+    File  *FileItem
+    Video *VideoItem
 }
 
-type ImageMessage struct {
-    Message
-    media mediaRef
+type TextItem struct {
+    Content string
 }
 
-type VoiceMessage struct {
-    Message
-    media mediaRef
+type ImageItem struct {
+    download func() (io.ReadCloser, error)  // 闭包，持有 ilinkClient 引用
 }
 
-type FileMessage struct {
-    Message
+func (i *ImageItem) Download() (io.ReadCloser, error)
+
+type VoiceItem struct {
+    download func() (io.ReadCloser, error)
+}
+
+func (i *VoiceItem) Download() (io.ReadCloser, error)
+
+type FileItem struct {
     FileName string
     FileSize int64
-    media    mediaRef
+    download func() (io.ReadCloser, error)
 }
 
-type VideoMessage struct {
-    Message
-    media mediaRef
+func (i *FileItem) Download() (io.ReadCloser, error)
+
+type VideoItem struct {
+    download func() (io.ReadCloser, error)
 }
+
+func (i *VideoItem) Download() (io.ReadCloser, error)
 ```
 
-`mediaRef` 是不导出的内部结构，封装 CDN 下载参数：
-
-```go
-type mediaRef struct {
-    encryptQueryParam string
-    aesKey            string
-    encryptType       int
-    download          func() (io.ReadCloser, error)  // 闭包，持有 ilinkClient 引用
-}
-```
-
-### 4.2 媒体按需下载
-
-```go
-func (m *ImageMessage) Download() (io.ReadCloser, error)
-func (m *VoiceMessage) Download() (io.ReadCloser, error)
-func (m *FileMessage) Download() (io.ReadCloser, error)
-func (m *VideoMessage) Download() (io.ReadCloser, error)
-```
-
-内部通过 `mediaRef.download` 闭包实现（构造消息时注入 `ilinkClient` 引用）：CDN 下载 → AES-128-ECB 解密 → 返回 `io.ReadCloser`。
+`Download()` 内部通过闭包实现（构造 Item 时注入 `ilinkClient` 引用）：CDN 下载 → AES-128-ECB 解密 → 返回 `io.ReadCloser`。
 
 ### 4.3 Handler 注册
 
 ```go
-type TextHandler    func(ctx Context, msg TextMessage)
-type ImageHandler   func(ctx Context, msg ImageMessage)
-type VoiceHandler   func(ctx Context, msg VoiceMessage)
-type FileHandler    func(ctx Context, msg FileMessage)
-type VideoHandler   func(ctx Context, msg VideoMessage)
 type MessageHandler func(ctx Context, msg Message)
 type QRHandler      func(qr QRCode)
 
-func (b *Bot) OnText(h TextHandler)
-func (b *Bot) OnImage(h ImageHandler)
-func (b *Bot) OnVoice(h VoiceHandler)
-func (b *Bot) OnFile(h FileHandler)
-func (b *Bot) OnVideo(h VideoHandler)
 func (b *Bot) OnMessage(h MessageHandler)
 ```
+
+只有一个 `OnMessage`。用户在 handler 内遍历 `msg.Items` 自行处理不同类型。
 
 ### 4.4 分发逻辑
 
 Handler 在轮询 goroutine 中**同步调用**。如需长时间处理（如下载大文件），handler 应自行启动 goroutine。
 
-一条微信消息的 `item_list` 可能包含多个 item。每个 item 独立分发，共享同一个 Context：
-
 ```
-收到消息 item_list
-  ├─ type=1 (text)  → OnText handler? → 调用 : OnMessage
-  ├─ type=2 (image) → OnImage handler? → 调用 : OnMessage
-  ├─ type=3 (voice) → OnVoice handler? → 调用 : OnMessage
-  ├─ type=4 (file)  → OnFile handler? → 调用 : OnMessage
-  ├─ type=5 (video) → OnVideo handler? → 调用 : OnMessage
-  └─ 未知类型 → OnMessage
+收到消息
+  → 解析 item_list → 构造 Message{Items: [...]}
+  → 调用 OnMessage handler（整条消息一次回调）
 ```
 
 ## 5. Context 与发送
@@ -522,11 +520,10 @@ func aesECBDecrypt(data []byte, key []byte) ([]byte, error)
 
 ```
 github.com/fuzhong-jiye/wechat-bot-go/
-├── bot.go              // Bot, NewBot, Start, Stop, Reconnect, Errors
+├── bot.go              // Bot, NewBot, Start, Stop, Reconnect, Errors, OnMessage
 ├── option.go           // Option, With* 函数
-├── handler.go          // handler 注册与分发逻辑
 ├── context.go          // Context, Reply*, Sender, Bot
-├── message.go          // Message, TextMessage, ImageMessage, etc.
+├── message.go          // Message, Item, TextItem, ImageItem, etc.
 ├── client.go           // ilinkClient, do(), 认证头, API 方法
 ├── crypto.go           // AES-128-ECB 加解密
 ├── storage.go          // Storage 接口, Session, TokenEntry
@@ -568,24 +565,24 @@ func main() {
         }),
     )
 
-    // 在 handler 中回复
-    bot.OnText(func(ctx wechat.Context, msg wechat.TextMessage) {
-        log.Printf("收到文本: %s", msg.Text)
-        ctx.Reply("你说了: " + msg.Text)
-    })
-
-    bot.OnImage(func(ctx wechat.Context, msg wechat.ImageMessage) {
-        reader, err := msg.Download()
-        if err != nil {
-            log.Println("下载失败:", err)
-            return
-        }
-        defer reader.Close()
-        ctx.Reply("图片已收到")
-    })
-
     bot.OnMessage(func(ctx wechat.Context, msg wechat.Message) {
-        log.Println("收到未处理消息类型")
+        for _, item := range msg.Items {
+            switch item.Type {
+            case wechat.ItemText:
+                log.Printf("收到文本: %s", item.Text.Content)
+                ctx.Reply("你说了: " + item.Text.Content)
+            case wechat.ItemImage:
+                reader, err := item.Image.Download()
+                if err != nil {
+                    log.Println("下载失败:", err)
+                    continue
+                }
+                reader.Close()
+                ctx.Reply("图片已收到")
+            default:
+                log.Printf("未处理类型: %d", item.Type)
+            }
+        }
     })
 
     ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt)
@@ -644,8 +641,10 @@ for _, id := range userIDs {
             fmt.Printf("[%s] 请扫码: %s\n", id, qr.URL)
         }),
     )
-    bot.OnText(func(ctx wechat.Context, msg wechat.TextMessage) {
-        ctx.Reply("收到: " + msg.Text)
+    bot.OnMessage(func(ctx wechat.Context, msg wechat.Message) {
+        if text := msg.Text(); text != "" {
+            ctx.Reply("收到: " + text)
+        }
     })
     go bot.Start(ctx)
 }
