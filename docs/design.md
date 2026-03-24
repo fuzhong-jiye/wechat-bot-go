@@ -7,9 +7,14 @@
 
 基于现有 TypeScript 微信 bot 项目中对 iLink Bot API 的实现，构建一个 Go SDK。定位为**高层 Bot 框架**，自动管理登录、轮询、会话状态和 contextToken，开发者只需注册消息处理回调。
 
+### 核心模型
+
+**一个 Bot 实例 = 一个用户的单聊对话。** Bot 登录后与唯一一个用户建立对话关系。如需与多个用户对话，创建多个 Bot 实例（使用不同 SessionID，共享同一个 Storage）。
+
 ### 约束
 
 - 仅支持私聊场景，不考虑群聊（收到群消息时静默忽略）
+- 一个 Bot 实例只处理与一个用户的对话
 - 单包结构（`package wechat`）
 - 底层通过 iLink Bot API（`ilinkai.weixin.qq.com`）与微信交互
 - 所有 API 请求体必须包含 `base_info: { channel_version: "1.0.2" }`
@@ -26,6 +31,7 @@
 | 媒体发送 | 完全封装（传 `io.Reader`） |
 | 媒体接收 | 按需下载（手动调用 `Download()`） |
 | 错误处理 | Error channel，用户控制重连 |
+| 对话模型 | 一个 Bot 实例 = 一个用户对话，多用户用多 Bot |
 | Context | 回复当前会话 + 通过 Bot 实例主动发送 |
 
 ## 3. Bot 生命周期
@@ -34,12 +40,13 @@
 
 ```go
 type Bot struct {
-    opts       options
-    handlers   handlerRegistry
-    client     *ilinkClient
-    session    *Session
-    errors     chan *BotError
-    stopCh     chan struct{}
+    opts         options
+    handlers     handlerRegistry
+    client       *ilinkClient
+    session      *Session
+    contextToken *TokenEntry      // 单个 token，对应唯一对话用户
+    errors       chan *BotError
+    stopCh       chan struct{}
 }
 
 func NewBot(opts ...Option) *Bot
@@ -88,10 +95,10 @@ Start(ctx)
   │       ├─ 调用 QRHandler 回调
   │       ├─ 轮询扫码状态
   │       └─ 获取 credentials → storage.SaveSession()
-  ├─ storage.LoadTokens(sessionID) → 恢复 contextTokens 到内存
+  ├─ storage.LoadToken(sessionID) → 恢复 contextToken 到内存
   ├─ 进入消息轮询循环
   │   ├─ pollMessages(cursor)
-  │   ├─ 更新 cursor + contextTokens
+  │   ├─ 更新 cursor + contextToken
   │   ├─ storage.SaveSession() + storage.SaveToken()
   │   ├─ 分发消息到 handler
   │   └─ 出错 → 写入 errors channel
@@ -255,27 +262,29 @@ func (c Context) Bot() *Bot
 
 ### 5.2 主动发送
 
-通过 Bot 实例向任意用户发消息，前提是已有该用户的有效 contextToken：
+通过 Bot 实例主动向对话用户发消息（不需要在 handler 中），前提是用户曾给 bot 发过消息（即存在有效 contextToken）：
 
 ```go
-func (b *Bot) Send(userID string, text string) error
-func (b *Bot) SendImage(userID string, r io.Reader, filename string) error
-func (b *Bot) SendVoice(userID string, r io.Reader, filename string) error
-func (b *Bot) SendFile(userID string, r io.Reader, filename string) error
-func (b *Bot) SendVideo(userID string, r io.Reader, filename string) error
+func (b *Bot) Send(text string) error
+func (b *Bot) SendImage(r io.Reader, filename string) error
+func (b *Bot) SendVoice(r io.Reader, filename string) error
+func (b *Bot) SendFile(r io.Reader, filename string) error
+func (b *Bot) SendVideo(r io.Reader, filename string) error
 ```
+
+不需要传 `userID` — 一个 Bot 实例只对应一个用户。
 
 ### 5.3 contextToken 管理
 
-SDK 自动管理，用户不需要感知。内部使用导出的 `TokenEntry` 类型（与 Storage 接口共享）。
+SDK 自动管理，用户不需要感知。一个 Bot 实例只维护一个 contextToken。
 
-- 轮询收到消息 → `contextTokens[fromUserID] = tokenEntry{token, time.Now()}` → 持久化
-- 发送时查找 → 不存在返回 `ErrNoContextToken`，超过 24h 返回 `ErrContextTokenExpired`
-- 不做自动清理，过期 token 保留，用户重新发消息自然刷新
+- 轮询收到消息 → `bot.contextToken = TokenEntry{token, time.Now()}` → 持久化
+- 发送时检查 → 不存在返回 `ErrNoContextToken`，超过 24h 返回 `ErrContextTokenExpired`
+- 过期 token 保留，用户重新发消息自然刷新
 
 ```go
 var ErrNoContextToken = errors.New(
-    "wechat: no context token for this user, " +
+    "wechat: no context token, " +
     "the user must message the bot first",
 )
 
@@ -331,8 +340,8 @@ type Storage interface {
     DeleteSession(sessionID string) error
     ListSessions() ([]Session, error)
 
-    SaveToken(sessionID string, userID string, entry TokenEntry) error
-    LoadTokens(sessionID string) (map[string]TokenEntry, error)
+    SaveToken(sessionID string, entry TokenEntry) error
+    LoadToken(sessionID string) (TokenEntry, bool, error)  // bool=是否存在
 }
 
 type Session struct {
@@ -380,11 +389,9 @@ CREATE TABLE sessions (
 );
 
 CREATE TABLE context_tokens (
-    session_id TEXT NOT NULL,
-    user_id    TEXT NOT NULL,
+    session_id TEXT PRIMARY KEY,
     token      TEXT NOT NULL,
     updated_at DATETIME NOT NULL,
-    PRIMARY KEY (session_id, user_id),
     FOREIGN KEY (session_id) REFERENCES sessions(id) ON DELETE CASCADE
 );
 ```
@@ -392,7 +399,7 @@ CREATE TABLE context_tokens (
 ### 6.4 Storage 调用时机
 
 ```
-Start()        → LoadSession + LoadTokens
+Start()        → LoadSession + LoadToken
 登录成功        → SaveSession
 每次轮询新消息  → SaveSession (cursor) + SaveToken (contextToken)
 Stop()         → SaveSession (最后保存 cursor)
@@ -508,7 +515,7 @@ func aesECBDecrypt(data []byte, key []byte) ([]byte, error)
 |------|------|
 | `*APIError` | iLink API 返回的业务错误 |
 | `*BotError` | 带分类的运行时错误（通过 error channel） |
-| `ErrNoContextToken` | 用户从未给 bot 发过消息 |
+| `ErrNoContextToken` | 用户尚未给 bot 发过消息 |
 | `ErrContextTokenExpired` | contextToken 超过 24 小时过期 |
 
 ## 10. 文件结构
@@ -530,6 +537,8 @@ github.com/fuzhong-jiye/wechat-bot-go/
 ```
 
 ## 11. 完整用户示例
+
+### 11.1 基础用法 — 一个 Bot 对应一个用户
 
 ```go
 package main
@@ -559,19 +568,13 @@ func main() {
         }),
     )
 
-    // 记住最后活跃用户，用于主动发送演示
-    var lastActiveUser string
-
+    // 在 handler 中回复
     bot.OnText(func(ctx wechat.Context, msg wechat.TextMessage) {
-        log.Printf("收到文本 [%s]: %s", ctx.Sender(), msg.Text)
-        lastActiveUser = ctx.Sender()
-
-        // 通过 Context 回复当前会话
+        log.Printf("收到文本: %s", msg.Text)
         ctx.Reply("你说了: " + msg.Text)
     })
 
     bot.OnImage(func(ctx wechat.Context, msg wechat.ImageMessage) {
-        log.Printf("收到图片 from %s", ctx.Sender())
         reader, err := msg.Download()
         if err != nil {
             log.Println("下载失败:", err)
@@ -582,7 +585,7 @@ func main() {
     })
 
     bot.OnMessage(func(ctx wechat.Context, msg wechat.Message) {
-        log.Printf("收到未处理消息类型, from %s", ctx.Sender())
+        log.Println("收到未处理消息类型")
     })
 
     ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt)
@@ -594,18 +597,15 @@ func main() {
         }
     }()
 
-    // 演示：每 60 秒主动给最后活跃用户发一条消息
+    // 主动发送 — 不需要指定 userID，Bot 只对应一个用户
     go func() {
         ticker := time.NewTicker(60 * time.Second)
         defer ticker.Stop()
         for {
             select {
             case <-ticker.C:
-                if lastActiveUser != "" {
-                    err := bot.Send(lastActiveUser, "这是一条主动发送的消息")
-                    if err != nil {
-                        log.Println("主动发送失败:", err)
-                    }
+                if err := bot.Send("这是一条定时主动消息"); err != nil {
+                    log.Println("主动发送失败:", err)
                 }
             case <-ctx.Done():
                 return
@@ -613,6 +613,7 @@ func main() {
         }
     }()
 
+    // 错误处理
     for {
         select {
         case err := <-bot.Errors():
@@ -625,5 +626,27 @@ func main() {
             return
         }
     }
+}
+```
+
+### 11.2 多用户场景 — 多个 Bot 共享 Storage
+
+```go
+store, _ := wechat.NewSQLiteStorage("bots.db")
+
+// 每个 Bot 实例对应一个用户对话
+userIDs := []string{"user-alice", "user-bob"}
+for _, id := range userIDs {
+    bot := wechat.NewBot(
+        wechat.WithStorage(store),
+        wechat.WithSessionID(id),
+        wechat.WithQRHandler(func(qr wechat.QRCode) {
+            fmt.Printf("[%s] 请扫码: %s\n", id, qr.URL)
+        }),
+    )
+    bot.OnText(func(ctx wechat.Context, msg wechat.TextMessage) {
+        ctx.Reply("收到: " + msg.Text)
+    })
+    go bot.Start(ctx)
 }
 ```
