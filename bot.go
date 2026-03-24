@@ -74,6 +74,7 @@ type Bot struct {
 	client  *ilinkClient
 	handler func(msg Message)
 	cancel  context.CancelFunc
+	runCtx  context.Context
 }
 
 // NewBot creates a new Bot with the given options.
@@ -126,8 +127,15 @@ func (b *Bot) Start(ctx context.Context) error {
 	ctx, cancel := context.WithCancel(ctx)
 	b.mu.Lock()
 	b.cancel = cancel
+	b.runCtx = ctx
 	b.mu.Unlock()
-	defer cancel()
+	defer func() {
+		cancel()
+		b.mu.Lock()
+		b.runCtx = nil
+		b.cancel = nil
+		b.mu.Unlock()
+	}()
 	b.log(ctx, LogInfo, "bot.start")
 
 	// Load session
@@ -178,6 +186,15 @@ func (b *Bot) Stop() {
 	if b.cancel != nil {
 		b.cancel()
 	}
+}
+
+func (b *Bot) operationContext() context.Context {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if b.runCtx != nil {
+		return b.runCtx
+	}
+	return context.Background()
 }
 
 func (b *Bot) login(ctx context.Context) error {
@@ -346,26 +363,46 @@ func (b *Bot) poll(ctx context.Context) error {
 // --- Send methods ---
 
 func (b *Bot) checkContextToken() error {
-	if b.session.ContextToken == "" {
-		b.log(context.Background(), LogWarn, "context_token.missing")
+	return checkContextTokenValue(b.session.ContextToken, b.session.TokenUpdatedAt)
+}
+
+func checkContextTokenValue(contextToken string, tokenUpdatedAt time.Time) error {
+	if contextToken == "" {
 		return ErrNoContextToken
 	}
-	if time.Since(b.session.TokenUpdatedAt) > 24*time.Hour {
-		b.log(context.Background(), LogWarn, "context_token.expired")
+	if time.Since(tokenUpdatedAt) > 24*time.Hour {
 		return ErrContextTokenExpired
 	}
 	return nil
 }
 
+func contextTokenLogMessage(err error) string {
+	switch err {
+	case ErrNoContextToken:
+		return "context_token.missing"
+	case ErrContextTokenExpired:
+		return "context_token.expired"
+	default:
+		return "context_token.invalid"
+	}
+}
+
 // Send sends a text message to the conversation user.
 func (b *Bot) Send(text string) error {
-	b.mu.Lock()
-	defer b.mu.Unlock()
+	ctx := b.operationContext()
 
-	if b.client == nil {
+	b.mu.Lock()
+	client := b.client
+	peerUserID := b.session.PeerUserID
+	contextToken := b.session.ContextToken
+	tokenUpdatedAt := b.session.TokenUpdatedAt
+	b.mu.Unlock()
+
+	if client == nil {
 		return fmt.Errorf("wechat: bot not started")
 	}
-	if err := b.checkContextToken(); err != nil {
+	if err := checkContextTokenValue(contextToken, tokenUpdatedAt); err != nil {
+		b.log(ctx, LogWarn, contextTokenLogMessage(err))
 		return err
 	}
 
@@ -373,11 +410,11 @@ func (b *Bot) Send(text string) error {
 		BaseInfo: newBaseInfo(),
 		Msg: wireSendMsg{
 			FromUserID:   "",
-			ToUserID:     b.session.PeerUserID,
+			ToUserID:     peerUserID,
 			ClientID:     generateClientID(),
 			MessageType:  2,
 			MessageState: 2,
-			ContextToken: b.session.ContextToken,
+			ContextToken: contextToken,
 			ItemList: []wireItem{
 				{
 					Type:     int(ItemText),
@@ -386,15 +423,15 @@ func (b *Bot) Send(text string) error {
 			},
 		},
 	}
-	err := b.client.sendMessage(context.Background(), req)
+	err := client.sendMessage(ctx, req)
 	if err != nil {
-		b.log(context.Background(), LogError, "message.send.failed",
+		b.log(ctx, LogError, "message.send.failed",
 			Field{Key: "kind", Value: "text"},
 			Field{Key: "error", Value: sanitizeError(err)},
 		)
 		return err
 	}
-	b.log(context.Background(), LogInfo, "message.sent", Field{Key: "kind", Value: "text"})
+	b.log(ctx, LogInfo, "message.sent", Field{Key: "kind", Value: "text"})
 	return nil
 }
 
@@ -431,13 +468,20 @@ func (b *Bot) SendVideo(r io.Reader, filename string) error {
 }
 
 func (b *Bot) sendMedia(r io.Reader, filename string, itemType ItemType) error {
-	b.mu.Lock()
-	defer b.mu.Unlock()
+	ctx := b.operationContext()
 
-	if b.client == nil {
+	b.mu.Lock()
+	client := b.client
+	peerUserID := b.session.PeerUserID
+	contextToken := b.session.ContextToken
+	tokenUpdatedAt := b.session.TokenUpdatedAt
+	b.mu.Unlock()
+
+	if client == nil {
 		return fmt.Errorf("wechat: bot not started")
 	}
-	if err := b.checkContextToken(); err != nil {
+	if err := checkContextTokenValue(contextToken, tokenUpdatedAt); err != nil {
+		b.log(ctx, LogWarn, contextTokenLogMessage(err))
 		return err
 	}
 
@@ -459,11 +503,10 @@ func (b *Bot) sendMedia(r io.Reader, filename string, itemType ItemType) error {
 
 	aesKeyHex := hex.EncodeToString(aesKey)
 
-	ctx := context.Background()
-	uploadResp, err := b.client.getUploadURL(ctx, wireUploadURLRequest{
+	uploadResp, err := client.getUploadURL(ctx, wireUploadURLRequest{
 		FileKey:     filekey,
 		MediaType:   uploadMediaType(itemType),
-		ToUserID:    b.session.PeerUserID,
+		ToUserID:    peerUserID,
 		RawSize:     rawSize,
 		RawFileMD5:  rawFileMD5,
 		FileSize:    paddedSize,
@@ -485,7 +528,7 @@ func (b *Bot) sendMedia(r io.Reader, filename string, itemType ItemType) error {
 	}
 
 	cdnURL := buildCDNUploadURL(cdnBaseURL, uploadResp.UploadParam, filekey)
-	downloadParam, err := b.client.uploadToCDN(ctx, cdnURL, encrypted)
+	downloadParam, err := client.uploadToCDN(ctx, cdnURL, encrypted)
 	if err != nil {
 		b.log(ctx, LogError, "media.upload.failed",
 			Field{Key: "kind", Value: itemType.String()},
@@ -522,15 +565,15 @@ func (b *Bot) sendMedia(r io.Reader, filename string, itemType ItemType) error {
 		BaseInfo: newBaseInfo(),
 		Msg: wireSendMsg{
 			FromUserID:   "",
-			ToUserID:     b.session.PeerUserID,
+			ToUserID:     peerUserID,
 			ClientID:     generateClientID(),
 			MessageType:  2,
 			MessageState: 2,
-			ContextToken: b.session.ContextToken,
+			ContextToken: contextToken,
 			ItemList:     []wireItem{item},
 		},
 	}
-	err = b.client.sendMessage(ctx, req)
+	err = client.sendMessage(ctx, req)
 	if err != nil {
 		b.log(ctx, LogError, "message.send.failed",
 			Field{Key: "kind", Value: itemType.String()},
