@@ -15,7 +15,7 @@ import (
 
 // QRCode contains the data returned when requesting a login QR code.
 type QRCode struct {
-	URL         string // scannable QR code content/URL
+	URL string // scannable QR code content/URL
 }
 
 // QRHandler is called when a QR code is available for scanning.

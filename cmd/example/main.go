@@ -14,7 +14,7 @@ func main() {
 		Level: slog.LevelInfo,
 	}))
 
-	store, err := wechat.NewSQLiteStorage("bot.db")
+	store, err := wechat.NewJSONFileStorage("bot.json")
 	if err != nil {
 		logger.Error("init storage failed", "error", err)
 		os.Exit(1)

@@ -17,7 +17,7 @@
 安装依赖：
 
 ```bash
-go get github.com/fuzhong-jiye/wechat-bot-go@v1.0.0
+go get github.com/fuzhong-jiye/wechat-bot-go@v1.0.2
 ```
 
 如果你想运行仓库内示例：
@@ -25,12 +25,51 @@ go get github.com/fuzhong-jiye/wechat-bot-go@v1.0.0
 ```bash
 git clone https://github.com/fuzhong-jiye/wechat-bot-go.git
 cd wechat-bot-go
+go run ./cmd/simple
+```
+
+完整回声示例：
+
+```bash
 go run ./cmd/example
 ```
 
 ## 快速开始
 
-下面示例展示了如何初始化一个 Bot、输出扫码二维码，并在收到文本消息后自动回复：
+最简单启动一个 Bot：
+
+```go
+package main
+
+import (
+	"context"
+	"fmt"
+
+	wechat "github.com/fuzhong-jiye/wechat-bot-go"
+)
+
+func main() {
+	bot := wechat.NewBot(
+		wechat.WithQRHandler(func(qr wechat.QRCode) {
+			fmt.Println("请扫码登录:", qr.URL)
+		}),
+	)
+
+	bot.OnMessage(func(msg wechat.Message) {
+		if text := msg.Text(); text != "" {
+			if err := bot.Send("你刚才说的是: " + text); err != nil {
+				fmt.Printf("发送失败: %v\n", err)
+			}
+		}
+	})
+
+	if err := bot.Start(context.Background()); err != nil {
+		panic(err)
+	}
+}
+```
+
+如果你想在重启后保留 session、接入日志并优雅退出，可以参考完整示例：
 
 ```go
 package main
@@ -47,7 +86,7 @@ import (
 func main() {
 	logger := slog.New(slog.NewTextHandler(os.Stdout, nil))
 
-	store, err := wechat.NewSQLiteStorage("bot.db")
+	store, err := wechat.NewJSONFileStorage("bot.json")
 	if err != nil {
 		panic(err)
 	}
@@ -143,14 +182,3 @@ bot.SendVideo(reader, "clip.mp4")
 - 发送消息前，用户必须先给 Bot 发过消息，否则会返回 `ErrNoContextToken`
 - 如果用户超过 24 小时未发消息，可能返回 `ErrContextTokenExpired`
 - 会话失效时，`Start` 可能返回 `ErrSessionExpired`
-
-## 本地开发
-
-常用命令：
-
-```bash
-go test ./...
-go build ./...
-go run ./cmd/example
-gofmt -w *.go cmd/example/*.go
-```

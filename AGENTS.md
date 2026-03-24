@@ -2,7 +2,7 @@
 
 ## Project Structure & Module Organization
 
-This repository is a small Go module for a WeChat bot SDK. Core library code lives at the repository root in `package wechat` (`bot.go`, `client.go`, `message.go`, `storage.go`, `sqlite.go`, `logger.go`). Tests sit beside the implementation as `*_test.go`. The runnable example is in `cmd/example/main.go`. Design notes and implementation plans are under `docs/`, including `docs/design.md` and `docs/superpowers/`.
+This repository is a small Go module for a WeChat bot SDK. Core library code lives at the repository root in `package wechat` (`bot.go`, `client.go`, `message.go`, `storage.go`, `json_file_storage.go`, `logger.go`). Tests sit beside the implementation as `*_test.go`. The runnable example is in `cmd/example/main.go`. Design notes and implementation plans are under `docs/`, including `docs/design.md` and `docs/superpowers/`.
 
 ## Build, Test, and Development Commands
 
@@ -20,7 +20,7 @@ Follow standard Go formatting and idioms: tabs for indentation, `gofmt` output a
 
 ## Testing Guidelines
 
-Use the standard `testing` package. Add tests in the same directory as the code they cover, named `*_test.go`, and prefer `TestXxx` names that match the public behavior under test. Cover both happy paths and error handling, especially around session state, polling, crypto helpers, and SQLite-backed storage.
+Use the standard `testing` package. Add tests in the same directory as the code they cover, named `*_test.go`, and prefer `TestXxx` names that match the public behavior under test. Cover both happy paths and error handling, especially around session state, polling, crypto helpers, and JSON file-backed storage.
 
 ## Commit & Pull Request Guidelines
 
@@ -28,4 +28,4 @@ Recent history uses conventional prefixes such as `feat:` and `docs:`; keep that
 
 ## Security & Configuration Tips
 
-Do not commit live session data or local databases such as `bot.db`. Treat tokens, QR login flows, and persisted session state as sensitive. Keep example configuration local and avoid embedding credentials in source or docs.
+Do not commit live session data or local session files such as `bot.json`. Treat tokens, QR login flows, and persisted session state as sensitive. Keep example configuration local and avoid embedding credentials in source or docs.
