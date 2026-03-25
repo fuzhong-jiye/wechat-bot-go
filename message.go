@@ -74,9 +74,11 @@ type TextItem struct {
 
 // ImageItem contains image metadata and download capability.
 type ImageItem struct {
-	Width    int
-	Height   int
-	download func() (io.ReadCloser, error)
+	Width             int
+	Height            int
+	EncryptQueryParam string // CDN download parameter
+	AESKey            string // CDN decryption key (base64)
+	download          func() (io.ReadCloser, error)
 }
 
 // Download fetches and decrypts the image from CDN.
@@ -86,10 +88,12 @@ func (i *ImageItem) Download() (io.ReadCloser, error) {
 
 // VoiceItem contains voice message metadata and download capability.
 type VoiceItem struct {
-	Duration   int    // playtime in milliseconds
-	EncodeType int    // codec: 1=pcm, 2=adpcm, 6=silk, 7=mp3, etc.
-	Text       string // voice-to-text transcription (may be empty)
-	download   func() (io.ReadCloser, error)
+	Duration          int    // playtime in milliseconds
+	EncodeType        int    // codec: 1=pcm, 2=adpcm, 6=silk, 7=mp3, etc.
+	Text              string // voice-to-text transcription (may be empty)
+	EncryptQueryParam string // CDN download parameter
+	AESKey            string // CDN decryption key (base64)
+	download          func() (io.ReadCloser, error)
 }
 
 // Download fetches and decrypts the voice message from CDN.
@@ -99,9 +103,11 @@ func (i *VoiceItem) Download() (io.ReadCloser, error) {
 
 // FileItem contains file metadata and download capability.
 type FileItem struct {
-	FileName string
-	FileSize int64
-	download func() (io.ReadCloser, error)
+	FileName          string
+	FileSize          int64
+	EncryptQueryParam string // CDN download parameter
+	AESKey            string // CDN decryption key (base64)
+	download          func() (io.ReadCloser, error)
 }
 
 // Download fetches and decrypts the file from CDN.
@@ -111,10 +117,12 @@ func (i *FileItem) Download() (io.ReadCloser, error) {
 
 // VideoItem contains video metadata and download capability.
 type VideoItem struct {
-	Duration int // play_length in seconds
-	Width    int
-	Height   int
-	download func() (io.ReadCloser, error)
+	Duration          int // play_length in seconds
+	Width             int
+	Height            int
+	EncryptQueryParam string // CDN download parameter
+	AESKey            string // CDN decryption key (base64)
+	download          func() (io.ReadCloser, error)
 }
 
 // Download fetches and decrypts the video from CDN.
@@ -153,6 +161,8 @@ func (c *ilinkClient) parseMessage(raw wireMessage) Message {
 					Height: wi.ImageItem.ThumbHeight,
 				}
 				if wi.ImageItem.Media != nil && wi.ImageItem.Media.EncryptQueryParam != "" {
+					img.EncryptQueryParam = wi.ImageItem.Media.EncryptQueryParam
+					img.AESKey = wi.ImageItem.Media.AESKey
 					img.download = c.newDownloadFunc(
 						wi.ImageItem.Media.EncryptQueryParam,
 						wi.ImageItem.Media.AESKey,
@@ -168,6 +178,8 @@ func (c *ilinkClient) parseMessage(raw wireMessage) Message {
 					Text:       wi.VoiceItem.Text,
 				}
 				if wi.VoiceItem.Media != nil && wi.VoiceItem.Media.EncryptQueryParam != "" {
+					v.EncryptQueryParam = wi.VoiceItem.Media.EncryptQueryParam
+					v.AESKey = wi.VoiceItem.Media.AESKey
 					v.download = c.newDownloadFunc(
 						wi.VoiceItem.Media.EncryptQueryParam,
 						wi.VoiceItem.Media.AESKey,
@@ -183,6 +195,8 @@ func (c *ilinkClient) parseMessage(raw wireMessage) Message {
 					FileSize: size,
 				}
 				if wi.FileItem.Media != nil && wi.FileItem.Media.EncryptQueryParam != "" {
+					f.EncryptQueryParam = wi.FileItem.Media.EncryptQueryParam
+					f.AESKey = wi.FileItem.Media.AESKey
 					f.download = c.newDownloadFunc(
 						wi.FileItem.Media.EncryptQueryParam,
 						wi.FileItem.Media.AESKey,
@@ -198,6 +212,8 @@ func (c *ilinkClient) parseMessage(raw wireMessage) Message {
 					Height:   wi.VideoItem.ThumbHeight,
 				}
 				if wi.VideoItem.Media != nil && wi.VideoItem.Media.EncryptQueryParam != "" {
+					v.EncryptQueryParam = wi.VideoItem.Media.EncryptQueryParam
+					v.AESKey = wi.VideoItem.Media.AESKey
 					v.download = c.newDownloadFunc(
 						wi.VideoItem.Media.EncryptQueryParam,
 						wi.VideoItem.Media.AESKey,

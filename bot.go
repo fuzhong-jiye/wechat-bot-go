@@ -587,3 +587,76 @@ func (b *Bot) sendMedia(r io.Reader, filename string, itemType ItemType) error {
 	)
 	return nil
 }
+
+// CDNMedia holds pre-uploaded CDN media parameters for sending without re-uploading.
+type CDNMedia struct {
+	EncryptQueryParam string
+	AESKey            string
+	EncryptType       int
+}
+
+// SendCDNMedia sends a pre-uploaded CDN media item to the conversation user.
+// This skips the upload step and constructs a send request directly from CDN params.
+func (b *Bot) SendCDNMedia(media CDNMedia, filename string, itemType ItemType) error {
+	ctx := b.operationContext()
+
+	b.mu.Lock()
+	client := b.client
+	peerUserID := b.session.PeerUserID
+	contextToken := b.session.ContextToken
+	tokenUpdatedAt := b.session.TokenUpdatedAt
+	b.mu.Unlock()
+
+	if client == nil {
+		return fmt.Errorf("wechat: bot not started")
+	}
+	if err := checkContextTokenValue(contextToken, tokenUpdatedAt); err != nil {
+		b.log(ctx, LogWarn, contextTokenLogMessage(err))
+		return err
+	}
+
+	cdnMedia := &wireCDNMedia{
+		EncryptQueryParam: media.EncryptQueryParam,
+		AESKey:            media.AESKey,
+		EncryptType:       media.EncryptType,
+	}
+
+	item := wireItem{Type: int(itemType)}
+	switch itemType {
+	case ItemImage:
+		item.ImageItem = &wireImageItem{Media: cdnMedia}
+	case ItemVoice:
+		item.VoiceItem = &wireVoiceItem{Media: cdnMedia}
+	case ItemFile:
+		item.FileItem = &wireFileItem{Media: cdnMedia, FileName: filename}
+	case ItemVideo:
+		item.VideoItem = &wireVideoItem{Media: cdnMedia}
+	}
+
+	req := wireSendRequest{
+		BaseInfo: newBaseInfo(),
+		Msg: wireSendMsg{
+			FromUserID:   "",
+			ToUserID:     peerUserID,
+			ClientID:     generateClientID(),
+			MessageType:  2,
+			MessageState: 2,
+			ContextToken: contextToken,
+			ItemList:     []wireItem{item},
+		},
+	}
+	err := client.sendMessage(ctx, req)
+	if err != nil {
+		b.log(ctx, LogError, "message.send.failed",
+			Field{Key: "kind", Value: itemType.String()},
+			Field{Key: "error", Value: sanitizeError(err)},
+		)
+		return err
+	}
+	b.log(ctx, LogInfo, "message.sent",
+		Field{Key: "kind", Value: itemType.String()},
+		Field{Key: "filename", Value: filename},
+		Field{Key: "cdn", Value: true},
+	)
+	return nil
+}
